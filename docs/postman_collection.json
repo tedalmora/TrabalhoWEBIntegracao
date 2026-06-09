@@ -1,0 +1,78 @@
+{
+  "info": {
+    "name": "IoT Sensores API",
+    "_postman_id": "iot-sensores-flask-hbase",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5000" },
+    { "key": "sensorId", "value": "sen_temp_01" },
+    { "key": "atuadorId", "value": "atu_lamp_01" }
+  ],
+  "item": [
+    {
+      "name": "Index",
+      "request": { "method": "GET", "url": "{{baseUrl}}/" }
+    },
+    {
+      "name": "Health",
+      "request": { "method": "GET", "url": "{{baseUrl}}/health" }
+    },
+    {
+      "name": "Sensor - criar",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/sensores",
+        "body": { "mode": "raw", "raw": "{\n  \"id\": \"sen_temp_01\",\n  \"tipo\": \"temperatura\",\n  \"localizacao\": \"Sala 101\"\n}" }
+      }
+    },
+    {
+      "name": "Sensor - buscar por chave",
+      "request": { "method": "GET", "url": "{{baseUrl}}/sensores/{{sensorId}}" }
+    },
+    {
+      "name": "Sensor - listar com filtro",
+      "request": { "method": "GET", "url": "{{baseUrl}}/sensores?tipo=temperatura" }
+    },
+    {
+      "name": "Sensor - enviar leitura",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/sensores/{{sensorId}}/dados",
+        "body": { "mode": "raw", "raw": "{\n  \"valor\": 24.7,\n  \"unidade\": \"C\"\n}" }
+      }
+    },
+    {
+      "name": "Atuador - criar",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/atuadores",
+        "body": { "mode": "raw", "raw": "{\n  \"id\": \"atu_lamp_01\",\n  \"nome\": \"Lâmpada Sala 101\",\n  \"tipo\": \"lampada\"\n}" }
+      }
+    },
+    {
+      "name": "Atuador - enviar comando",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/atuadores/{{atuadorId}}/comando",
+        "body": { "mode": "raw", "raw": "{\n  \"comando\": \"LIGAR\"\n}" }
+      }
+    },
+    {
+      "name": "Externo - clima",
+      "request": { "method": "GET", "url": "{{baseUrl}}/clima?cidade=Curitiba,BR" }
+    },
+    {
+      "name": "Externo - sincronizar como leitura",
+      "request": { "method": "POST", "url": "{{baseUrl}}/clima/sincronizar/{{sensorId}}?cidade=Curitiba,BR" }
+    },
+    {
+      "name": "Leituras - lista filtrada",
+      "request": { "method": "GET", "url": "{{baseUrl}}/leituras?sensor_id={{sensorId}}&valor_min=10&limite=20" }
+    }
+  ]
+}

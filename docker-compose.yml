@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  hbase:
+    # Imagem do HBase standalone com Thrift habilitado (porta 9090).
+    image: dajobe/hbase:latest
+    container_name: iot_hbase
+    hostname: hbase
+    ports:
+      - "9090:9090"   # Thrift
+      - "16010:16010" # Web UI master
+    environment:
+      HBASE_MANAGES_ZK: "true"
+    healthcheck:
+      test: ["CMD-SHELL", "echo 'list' | hbase shell -n >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  api:
+    build: .
+    container_name: iot_api
+    depends_on:
+      - hbase
+    environment:
+      HBASE_HOST: hbase
+      HBASE_PORT: "9090"
+      HBASE_TABLE_PREFIX: iot
+      OPENWEATHER_API_KEY: ${OPENWEATHER_API_KEY:-}
+      OPENWEATHER_DEFAULT_CITY: ${OPENWEATHER_DEFAULT_CITY:-Curitiba,BR}
+      THINGSPEAK_WRITE_KEY: ${THINGSPEAK_WRITE_KEY:-}
+      THINGSPEAK_CHANNEL_ID: ${THINGSPEAK_CHANNEL_ID:-}
+      PORT: "5000"
+    ports:
+      - "5000:5000"
+    command: ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "run:app"]
