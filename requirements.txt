@@ -1,6 +1,6 @@
 Flask==3.0.3
-happybase==1.2.0
+flask-cors==4.0.1
 requests==2.32.3
 python-dotenv==1.0.1
-gunicorn==22.0.0
-flask-cors==4.0.1
+# Opcional — só se for usar HBase de verdade. No Python 3.14 também precisa de setuptools.
+happybase==1.2.0
