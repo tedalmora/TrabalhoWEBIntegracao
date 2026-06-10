@@ -2,5 +2,7 @@ Flask==3.0.3
 flask-cors==4.0.1
 requests==2.32.3
 python-dotenv==1.0.1
+# happybase 1.2 depende de pkg_resources, removido nas versões mais novas do setuptools.
+setuptools<81
 # Opcional — só se for usar HBase de verdade. No Python 3.14 também precisa de setuptools.
 happybase==1.2.0

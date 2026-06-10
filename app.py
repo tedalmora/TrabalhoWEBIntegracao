@@ -1,8 +1,14 @@
 """API REST de gerência de sensores IoT — versão simples (arquivo único).
 
-* Flask + HBase (via HappyBase). Se HBase indisponível, cai no modo
-  em memória definindo a variável USE_INMEMORY_DB=1.
+* Flask + HBase (via HappyBase).
 * Integração com OpenWeatherMap como webservice externo.
+
+Observação sobre a comunicação com o banco:
+- O código usa a biblioteca HappyBase.
+- O HappyBase não fala com o HBase "direto"; ele usa o protocolo Thrift.
+- Thrift é uma camada de comunicação RPC/binária: a aplicação Python abre
+    uma conexão de rede com o serviço Thrift do HBase (porta 9090, neste caso)
+    e envia comandos como criar tabela, gravar linha, consultar linha etc.
 
 Endpoints (todos JSON):
   GET    /                              catálogo
@@ -21,29 +27,28 @@ Endpoints (todos JSON):
   POST   /atuadores/<id>/comando        envia comando (sucesso/falha)
   GET    /clima?cidade=Curitiba,BR      webservice externo
 """
-import os
 import time
 import uuid
-import threading
 from contextlib import contextmanager
 
 import requests
 from flask import Flask, request, jsonify, abort
 from flask_cors import CORS
-from dotenv import load_dotenv
-
-# Carrega variáveis de ambiente do arquivo .env (quando existir).
-load_dotenv()
 
 # ---------------------------------------------------------------------
 # Configuração
 # ---------------------------------------------------------------------
-HBASE_HOST = os.getenv("HBASE_HOST", "localhost")
-HBASE_PORT = int(os.getenv("HBASE_PORT", "9090"))
-TABLE_PREFIX = os.getenv("HBASE_TABLE_PREFIX", "iot")
-# Quando true, ignora HBase real e usa armazenamento em memória.
-USE_INMEMORY = os.getenv("USE_INMEMORY_DB", "0").lower() in {"1", "true", "yes", "on"}
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
+# Como você pediu, as configurações ficam fixas no próprio código.
+# Isso deixa o arquivo mais simples de ler, ao custo de perder flexibilidade.
+HBASE_HOST = "localhost"
+HBASE_PORT = 9090
+TABLE_PREFIX = "iot"
+
+# Coloque aqui sua chave da OpenWeatherMap quando quiser usar o endpoint /clima.
+OPENWEATHER_API_KEY = ""
+
+# Porta HTTP do Flask.
+PORT = 5000
 
 # Nomes físicos das tabelas no banco (com prefixo para evitar colisões).
 T_SENSORES  = f"{TABLE_PREFIX}_sensores"
@@ -56,87 +61,71 @@ COMANDOS = {"LIGAR": "LIGADO", "DESLIGAR": "DESLIGADO",
 
 
 # ---------------------------------------------------------------------
-# Camada de dados: HBase real ou backend em memória (fallback)
+# Camada de dados: HBase real
 # ---------------------------------------------------------------------
-try:
-    import happybase  # type: ignore
-except Exception:
-    # Se a lib não existir, ainda podemos rodar no modo em memória.
-    happybase = None
-
-# Backend em memória: dict + lock. Usado quando USE_INMEMORY_DB=1.
-_MEM: dict[str, dict[bytes, dict[bytes, bytes]]] = {}
-_MEM_LOCK = threading.RLock()
-
-
-class _MemTable:
-    """Tabela fake com a mesma interface básica usada no HappyBase."""
-    def __init__(self, name): self.name = name
-    def row(self, key):
-        # Retorna cópia para não vazar referência mutável interna.
-        with _MEM_LOCK:
-            return dict(_MEM.get(self.name, {}).get(key, {}))
-    def put(self, key, data):
-        # Upsert de colunas (comportamento equivalente ao HBase put).
-        with _MEM_LOCK:
-            _MEM.setdefault(self.name, {}).setdefault(key, {}).update(data)
-    def delete(self, key):
-        with _MEM_LOCK:
-            _MEM.get(self.name, {}).pop(key, None)
-    def scan(self, row_prefix=None, limit=None, **_):
-        # Ordena chaves para simular scan lexicográfico do HBase.
-        with _MEM_LOCK:
-            keys = sorted(_MEM.get(self.name, {}).keys())
-        for i, k in enumerate(keys):
-            if row_prefix and not k.startswith(row_prefix):
-                continue
-            if limit is not None and i >= limit:
-                break
-            yield k, self.row(k)
-
-
-class _MemConnection:
-    """Conexão fake (somente métodos usados pela API)."""
-    def tables(self):
-        with _MEM_LOCK:
-            return [n.encode() for n in _MEM]
-    def create_table(self, name, _families):
-        with _MEM_LOCK:
-            _MEM.setdefault(name, {})
-    def table(self, name):
-        with _MEM_LOCK:
-            _MEM.setdefault(name, {})
-        return _MemTable(name)
-    def close(self): pass
+import happybase  # type: ignore
 
 
 @contextmanager
 def conexao():
-    """Abre conexão com HBase ou devolve a fake em memória."""
-    # Se USE_INMEMORY_DB estiver ativo (ou happybase indisponível),
-    # usamos implementação local sem dependência externa.
-    if USE_INMEMORY or happybase is None:
-        conn = _MemConnection()
-    else:
-        # HappyBase usa Thrift por trás para conversar com o HBase.
-        conn = happybase.Connection(host=HBASE_HOST, port=HBASE_PORT)
+    """Abre conexão com HBase real e garante fechamento no final.
+
+    Como funciona:
+    1. A função cria a conexão com o HBase.
+    2. O ``yield conn`` entrega essa conexão para o bloco ``with``.
+    3. Quando o bloco ``with`` termina, o código depois do ``yield`` roda.
+    4. Nesse ponto a conexão é fechada no ``finally``.
+
+    Exemplo de uso:
+
+        with conexao() as conn:
+            tabela = conn.table(T_SENSORES)
+            ...
+
+    O ganho prático é evitar repetir este padrão em toda rota:
+
+        conn = happybase.Connection(...)
+        try:
+            ...
+        finally:
+            conn.close()
+
+    Então, não é obrigatório, mas ajuda a:
+    - reduzir repetição;
+    - diminuir chance de esquecer ``close()``;
+    - deixar o código das rotas mais limpo.
+    """
+    # HappyBase usa Thrift por trás para conversar com o HBase.
+    conn = happybase.Connection(host=HBASE_HOST, port=HBASE_PORT)
     try:
+        # ``yield`` não é igual a ``return``.
+        # Aqui ele "entrega" temporariamente a conexão para quem chamou.
+        # Depois que o bloco ``with`` terminar, a execução volta para baixo.
         yield conn
     finally:
-        try: conn.close()
-        except Exception: pass
+        # Fechamento defensivo: mesmo se der erro na rota, tentamos fechar.
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def init_tabelas():
-    """Cria as 3 tabelas se ainda não existirem (idempotente)."""
-    # "famílias" são o agrupamento de colunas no modelo colunar do HBase.
+    """Cria as 3 tabelas se ainda não existirem (idempotente).
+
+    "Idempotente" significa: pode rodar várias vezes sem estragar nada.
+    Se a tabela já existe, ela não é recriada.
+    """
+    # "Famílias" são o agrupamento de colunas no modelo colunar do HBase.
     schema = {T_SENSORES: {"info": {}},
               T_ATUADORES: {"info": {}, "estado": {}},
               T_LEITURAS: {"dados": {}}}
     with conexao() as conn:
+        # conn.tables() devolve a lista de tabelas já existentes no HBase.
         existentes = {t.decode() if isinstance(t, bytes) else t for t in conn.tables()}
         for nome, fam in schema.items():
             if nome not in existentes:
+                # Cria a tabela com as famílias definidas acima.
                 conn.create_table(nome, fam)
 
 
@@ -149,16 +138,35 @@ def gerar_id(prefixo):
 
 
 def agora_ms():
-    """Timestamp atual em milissegundos."""
+    """Timestamp atual em milissegundos.
+
+    É usado para registrar o momento de criação e também para ordenar leituras.
+    """
     return int(time.time() * 1000)
 
 def to_hbase(familia, dados):
-    """Converte {col: valor} -> {b'familia:col': b'valor'}, ignorando None."""
+    """Converte dict Python para o formato esperado pelo HBase/HappyBase.
+
+    Exemplo:
+        {"tipo": "temperatura"}
+
+    vira:
+        {b"info:tipo": b"temperatura"}
+
+    O HBase trabalha com bytes; por isso codificamos chave e valor.
+    """
     return {f"{familia}:{k}".encode(): str(v).encode()
             for k, v in dados.items() if v is not None}
 
 def from_hbase(row):
-    """Converte uma linha HBase em dict simples (sem 'familia:')."""
+    """Converte uma linha HBase em dict simples para responder JSON.
+
+    Exemplo:
+        {b"info:tipo": b"temperatura"}
+
+    vira:
+        {"tipo": "temperatura"}
+    """
     out = {}
     for k, v in row.items():
         chave = k.decode() if isinstance(k, bytes) else k
@@ -173,6 +181,8 @@ def from_hbase(row):
 # ---------------------------------------------------------------------
 app = Flask(__name__)
 # Permite chamadas de front-end em outra origem (localhost:3000 etc.).
+# Se você só testar via curl/Postman, CORS nem é tão importante.
+# Ele passa a ser útil quando um navegador acessa sua API a partir de outro host/porta.
 CORS(app)
 
 try:
@@ -208,7 +218,10 @@ def index():
 
 @app.get("/health")
 def health():
-    """Health check da aplicação e da conectividade com o backend."""
+    """Health check da aplicação e da conectividade com o backend.
+
+    Se conseguir listar tabelas, consideramos o banco acessível.
+    """
     try:
         with conexao() as conn:
             conn.tables()
@@ -257,6 +270,7 @@ def listar_sensores():
     local = request.args.get("localizacao")
     out = []
     with conexao() as conn:
+        # scan() percorre todas as linhas da tabela.
         for key, row in conn.table(T_SENSORES).scan():
             d = from_hbase(row)
             # Filtros em memória após scan da tabela.
@@ -270,9 +284,11 @@ def listar_sensores():
 def atualizar_sensor(sid):
     """Atualiza apenas os campos permitidos de um sensor existente."""
     body = request.get_json(silent=True) or {}
-    if not body: abort(400, description="corpo vazio")
+    if not body:
+        abort(400, description="corpo vazio")
     permitidos = {k: body[k] for k in ("tipo", "localizacao", "descricao") if k in body}
-    if not permitidos: abort(400, description="nenhum campo válido para atualizar")
+    if not permitidos:
+        abort(400, description="nenhum campo válido para atualizar")
     with conexao() as conn:
         tabela = conn.table(T_SENSORES)
         if not tabela.row(sid.encode()):
@@ -304,6 +320,8 @@ def enviar_leitura(sid):
         ts = agora_ms()
         # row key com timestamp invertido: as leituras mais recentes
         # vêm primeiro num scan por prefixo (truque clássico do HBase).
+        # Ex.: se ts é maior, 10**13 - ts é menor, então a ordenação ajuda
+        # a trazer as leituras novas antes das antigas.
         row_key = f"{sid}#{10**13 - ts}".encode()
         leitura = {"sensor_id": sid, "valor": body["valor"],
                    "unidade": body.get("unidade", ""), "timestamp": ts}
@@ -318,6 +336,7 @@ def listar_leituras_sensor(sid):
     limite = int(request.args.get("limite", "50"))
     out = []
     with conexao() as conn:
+        # row_prefix filtra apenas as linhas cuja key começa com "sid#".
         for _, row in conn.table(T_LEITURAS).scan(row_prefix=f"{sid}#".encode(), limit=limite):
             out.append(from_hbase(row))
     return jsonify({"sensor_id": sid, "total": len(out), "leituras": out})
@@ -326,8 +345,10 @@ def listar_leituras_sensor(sid):
 # ---- LEITURAS (consulta global com filtros) --------------------------
 def _to_float(v):
     """Converte query string para float com fallback seguro."""
-    try: return float(v) if v not in (None, "") else None
-    except (TypeError, ValueError): return None
+    try:
+        return float(v) if v not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
 
 
 @app.get("/leituras")
@@ -342,13 +363,17 @@ def listar_leituras():
     with conexao() as conn:
         kwargs = {"limit": limite}
         # Prefix-scan reduz custo quando o filtro por sensor está presente.
-        if sensor_id: kwargs["row_prefix"] = f"{sensor_id}#".encode()
+        if sensor_id:
+            kwargs["row_prefix"] = f"{sensor_id}#".encode()
         for _, row in conn.table(T_LEITURAS).scan(**kwargs):
             item = from_hbase(row)
-            if unidade and item.get("unidade") != unidade: continue
+            if unidade and item.get("unidade") != unidade:
+                continue
             v = _to_float(item.get("valor"))
-            if vmin is not None and (v is None or v < vmin): continue
-            if vmax is not None and (v is None or v > vmax): continue
+            if vmin is not None and (v is None or v < vmin):
+                continue
+            if vmax is not None and (v is None or v > vmax):
+                continue
             out.append(item)
     return jsonify({"total": len(out), "leituras": out})
 
@@ -381,8 +406,10 @@ def listar_atuadores():
     with conexao() as conn:
         for key, row in conn.table(T_ATUADORES).scan():
             d = from_hbase(row)
-            if tipo and d.get("tipo", "").lower() != tipo.lower(): continue
-            if estado and d.get("atual", "").lower() != estado.lower(): continue
+            if tipo and d.get("tipo", "").lower() != tipo.lower():
+                continue
+            if estado and d.get("atual", "").lower() != estado.lower():
+                continue
             out.append({"id": key.decode(), **d})
     return jsonify({"total": len(out), "itens": out})
 
@@ -428,6 +455,7 @@ def consultar_clima():
     cidade = request.args.get("cidade", "Curitiba,BR")
     try:
         # timeout evita requisição "pendurada" em rede instável.
+        # Aqui a API atua como cliente HTTP de outro serviço web.
         r = requests.get("https://api.openweathermap.org/data/2.5/weather",
                          params={"q": cidade, "appid": OPENWEATHER_API_KEY,
                                  "units": "metric", "lang": "pt_br"}, timeout=10)
@@ -463,4 +491,4 @@ def _e500(_): return jsonify({"erro": "erro interno do servidor"}), 500
 if __name__ == "__main__":
     # debug=True facilita desenvolvimento local (auto-reload + traceback).
     # Em produção, execute com servidor WSGI e debug desabilitado.
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=PORT, debug=True)
